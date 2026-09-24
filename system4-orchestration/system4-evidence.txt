@@ -1,0 +1,11 @@
+System 4 — Layer 3 Orchestrator Evidence
+
+Tests: 33 passed in 92.63s
+Warm-tier total: 40 defects
+Hot-state size: 643 bytes
+SQL pre-filter: shift_monitor/warm.py:75-84
+Pipeline call: shift_monitor/pipeline.py:35
+Recovery threshold: shift_monitor/recovery.py:16
+Recovery decision: shift_monitor/recovery.py:23-29
+Resumed invocation: shift_monitor/invocation.py:59-92
+Live run: system4-run-output.txt
