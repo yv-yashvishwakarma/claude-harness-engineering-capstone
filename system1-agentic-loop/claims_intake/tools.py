@@ -48,7 +48,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Record one normalized fact extracted from the claimant's statements "
             "(e.g., incident_date, location, description, items_lost, injury_party). "
-            "Call once per fact. Facts accumulate into the case file used by routing."
+            "Call once per fact. Facts accumulate into the case file used by routing. "
+            "IMPORTANT: recording facts is not a terminal action. After fact collection, "
+            "the workflow must continue: if a genuinely material ambiguity remains, call "
+            "request_clarification once; otherwise call classify_claim, then assess_severity, "
+            "then exactly one terminal tool (route_to_adjuster or escalate_to_human). "
+            "Do not end the conversation merely because facts have been recorded."
         ),
         "input_schema": {
             "type": "object",
@@ -222,7 +227,20 @@ def _t_lookup_policy(session: ClaimSession, inp: dict[str, Any]) -> str:
     policy = session.policies.get(pid)
     if policy is None:
         return _err("permanent", False, f"policy_id {pid!r} not found")
-    return _ok(policy)
+
+    result = dict(policy)
+    result["workflow_complete"] = False
+    result["terminal_action_allowed"] = False
+    result["required_next_tool"] = "record_claim_fact"
+    result["workflow_next_action"] = (
+        "MANDATORY NEXT STEP: call record_claim_fact. "
+        "lookup_policy is not a terminal action and the claim workflow is not complete. "
+        "Do NOT end the conversation after this result. Record the relevant claim facts "
+        "before classification. After facts are recorded, resolve any material ambiguity "
+        "with request_clarification if needed, then call classify_claim, assess_severity, "
+        "and exactly one terminal tool."
+    )
+    return _ok(result)
 
 
 def _t_record_claim_fact(session: ClaimSession, inp: dict[str, Any]) -> str:
@@ -230,8 +248,22 @@ def _t_record_claim_fact(session: ClaimSession, inp: dict[str, Any]) -> str:
     value = inp.get("value")
     if not isinstance(field, str) or not isinstance(value, str):
         return _err("permanent", False, "field and value must both be strings")
+
     session.case_facts[field] = value
-    return _ok({"recorded": True, "field": field, "case_facts_count": len(session.case_facts)})
+
+    return _ok(
+        {
+            "recorded": True,
+            "field": field,
+            "case_facts_count": len(session.case_facts),
+            "workflow_complete": False,
+            "next_action": (
+                "Continue claim intake. Do not end the conversation. "
+                "If a material ambiguity about claim type remains, call "
+                "request_clarification once; otherwise call classify_claim."
+            ),
+        }
+    )
 
 
 def _t_classify_claim(session: ClaimSession, inp: dict[str, Any]) -> str:
@@ -244,6 +276,8 @@ def _t_classify_claim(session: ClaimSession, inp: dict[str, Any]) -> str:
         return _err("permanent", False, "confidence must be a number in [0,1]")
     if not isinstance(rationale, str):
         return _err("permanent", False, "rationale must be a string")
+    if session.classification is not None:
+        return _err("permanent", False, "classify_claim may only be called once")
     session.classification = {
         "claim_type": claim_type,
         "confidence": float(confidence),
@@ -259,6 +293,14 @@ def _t_assess_severity(session: ClaimSession, inp: dict[str, Any]) -> str:
         return _err("permanent", False, f"severity must be one of {SEVERITIES}")
     if not isinstance(rationale, str):
         return _err("permanent", False, "rationale must be a string")
+    if session.classification is None:
+        return _err(
+            "permanent",
+            False,
+            "classify_claim must be called before assess_severity",
+        )
+    if session.severity is not None:
+        return _err("permanent", False, "assess_severity may only be called once")
     session.severity = {"severity": severity, "rationale": rationale}
     return _ok({"recorded": True, **session.severity})
 
@@ -270,6 +312,19 @@ def _t_request_clarification(session: ClaimSession, inp: dict[str, Any]) -> str:
         return _err("permanent", False, "question must be a string")
     if not isinstance(candidates, list) or len(candidates) < 2:
         return _err("permanent", False, "ambiguity_between must list at least two candidate types")
+    if session.classification is not None:
+        return _err(
+            "permanent",
+            False,
+            "request_clarification must occur before classify_claim",
+        )
+    if session.clarifications_asked:
+        return _err(
+            "permanent",
+            False,
+            "request_clarification may only be called once per claim",
+        )
+
     session.clarifications_asked.append({"question": question, "candidates": list(candidates)})
 
     # Match the question against the fixture's scripted responses.
@@ -278,7 +333,10 @@ def _t_request_clarification(session: ClaimSession, inp: dict[str, Any]) -> str:
     qlow = question.lower()
     for pattern, reply in session.clarification_responses.items():
         if pattern.lower() in qlow:
+            session.clarification_replies.append(reply)
             return _ok({"claimant_reply": reply})
+
+    session.clarification_replies.append("NO_RESPONSE")
     return _ok({"claimant_reply": "NO_RESPONSE"})
 
 
@@ -295,6 +353,21 @@ def _t_route_to_adjuster(session: ClaimSession, inp: dict[str, Any]) -> str:
         return _err("permanent", False, "classify_claim must be called before routing")
     if session.severity is None:
         return _err("permanent", False, "assess_severity must be called before routing")
+    if session.classification["confidence"] < 0.6:
+        return _err(
+            "permanent",
+            False,
+            "classification confidence below 0.6; unresolved claim requires escalation",
+        )
+    if session.clarifications_asked and any(
+        reply.strip().upper() == "NO_RESPONSE"
+        for reply in session.clarification_replies
+    ):
+        return _err(
+            "permanent",
+            False,
+            "cannot route after an unanswered clarification; unresolved ambiguity requires escalation",
+        )
 
     record = {
         "claim_id": session.claim_id,

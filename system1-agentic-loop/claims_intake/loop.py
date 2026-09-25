@@ -69,13 +69,29 @@ def run(
         turn += 1
         budget.check()
         t0 = time.monotonic()
-        response = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system,
-            tools=tools,
-            messages=working_messages,
+        # While the workflow is still active, require the model to make
+        # progress with a tool call. After a terminal tool succeeds, allow
+        # the model to finish naturally with end_turn.
+        terminal_seen = any(
+            getattr(block, "name", None)
+            in {"route_to_adjuster", "escalate_to_human"}
+            for message in working_messages
+            if message.get("role") == "assistant"
+            for block in message.get("content", [])
+            if getattr(block, "type", None) == "tool_use"
         )
+
+        create_kwargs = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "system": system,
+            "tools": tools,
+            "messages": working_messages,
+        }
+        if not terminal_seen:
+            create_kwargs["tool_choice"] = {"type": "any"}
+
+        response = client.messages.create(**create_kwargs)
         latency_ms = (time.monotonic() - t0) * 1000.0
 
         input_tokens = int(response.usage.input_tokens)

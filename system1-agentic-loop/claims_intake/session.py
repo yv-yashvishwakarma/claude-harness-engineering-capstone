@@ -26,6 +26,7 @@ class ClaimSession:
     classification: dict[str, Any] | None = None
     severity: dict[str, Any] | None = None
     clarifications_asked: list[dict[str, Any]] = field(default_factory=list)
+    clarification_replies: list[str] = field(default_factory=list)
     routing: dict[str, Any] | None = None
     escalation: dict[str, Any] | None = None
 
